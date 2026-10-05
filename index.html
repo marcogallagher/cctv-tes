@@ -9,67 +9,65 @@
 <style>
   body {
     margin: 0;
+    min-height: 100vh;
     background: #0a0a0a;
     color: #e5e5e5;
     font-family: system-ui, sans-serif;
     display: flex;
     flex-direction: column;
     align-items: center;
+    justify-content: center;
     padding: 20px;
   }
-  .wrap {
-    position: relative;
-    width: 100%;
-    max-width: 500px;
-  }
-  video, #overlay {
-    width: 100%;
-    border-radius: 12px;
-  }
   video {
-    border: 2px solid #333;
-  }
-  #overlay {
     position: absolute;
-    top: 0;
-    left: 0;
-    pointer-events: none;
+    left: -9999px;
+    top: -9999px;
   }
-  #status {
-    margin-top: 16px;
-    font-size: 14px;
-    color: #888;
-    text-align: center;
+  #canvas-capture {
+    display: none;
+  }
+  h1 {
+    font-size: 18px;
+    font-weight: 600;
+    margin-bottom: 24px;
+    color: #e5e5e5;
   }
   button {
-    margin-top: 16px;
-    padding: 10px 20px;
+    padding: 14px 32px;
     background: #2563eb;
     color: white;
     border: none;
-    border-radius: 8px;
-    font-size: 14px;
+    border-radius: 10px;
+    font-size: 16px;
+    font-weight: 500;
     cursor: pointer;
   }
   button:disabled {
-    background: #444;
+    background: #333;
+    color: #777;
+  }
+  #status {
+    margin-top: 20px;
+    font-size: 13px;
+    color: #888;
+    text-align: center;
+    max-width: 320px;
   }
 </style>
 </head>
 <body>
 
-<div class="wrap">
-  <video id="camera" autoplay playsinline muted></video>
-  <canvas id="overlay"></canvas>
-</div>
-<canvas id="capture" style="display:none;"></canvas>
-<button id="toggleBtn" disabled>Mulai</button>
-<div id="status">Memuat model deteksi...</div>
+<h1>CCTV HP</h1>
+<button id="toggleBtn" disabled>Memuat...</button>
+<div id="status">Menyiapkan model deteksi</div>
+
+<video id="camera" autoplay playsinline muted></video>
+<canvas id="canvas-capture"></canvas>
 
 <script>
 const video = document.getElementById('camera');
-const overlay = document.getElementById('overlay');
-const captureCanvas = document.getElementById('capture');
+const captureCanvas = document.getElementById('canvas-capture');
 const statusEl = document.getElementById('status');
 const toggleBtn = document.getElementById('toggleBtn');
 
@@ -77,6 +75,7 @@ let model = null;
 let streaming = false;
 let detectIntervalId = null;
 let snapshotIntervalId = null;
+let lastKnownLocation = null; // { lat, lng, accuracy }
 
 const SNAPSHOT_INTERVAL_MS = 3000;  // kirim foto rutin tiap 3 detik
 const DETECT_INTERVAL_MS = 1000;    // cek orang tiap 1 detik, kirim tiap kali ketemu
@@ -84,10 +83,11 @@ const DETECT_INTERVAL_MS = 1000;    // cek orang tiap 1 detik, kirim tiap kali k
 async function loadModel() {
   try {
     model = await cocoSsd.load();
-    statusEl.textContent = "Model siap. Tekan Mulai.";
+    statusEl.textContent = "Siap. Tekan Mulai untuk mengaktifkan kamera dan lokasi.";
+    toggleBtn.textContent = "Mulai";
     toggleBtn.disabled = false;
   } catch (err) {
-    statusEl.textContent = "Gagal load model: " + err.message;
+    statusEl.textContent = "Gagal memuat model: " + err.message;
   }
 }
 
@@ -98,8 +98,43 @@ async function startCamera() {
   });
   video.srcObject = stream;
   await new Promise(resolve => { video.onloadedmetadata = resolve; });
-  overlay.width = video.videoWidth;
-  overlay.height = video.videoHeight;
+}
+
+function startLocationWatch() {
+  return new Promise((resolve) => {
+    if (!navigator.geolocation) {
+      resolve();
+      return;
+    }
+
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        lastKnownLocation = {
+          lat: pos.coords.latitude,
+          lng: pos.coords.longitude,
+          accuracy: pos.coords.accuracy
+        };
+        resolve();
+      },
+      (err) => {
+        console.error("Gagal ambil lokasi:", err.message);
+        resolve();
+      },
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+
+    navigator.geolocation.watchPosition(
+      (pos) => {
+        lastKnownLocation = {
+          lat: pos.coords.latitude,
+          lng: pos.coords.longitude,
+          accuracy: pos.coords.accuracy
+        };
+      },
+      (err) => console.error("Gagal update lokasi:", err.message),
+      { enableHighAccuracy: true, maximumAge: 10000, timeout: 10000 }
+    );
+  });
 }
 
 function captureFrame() {
@@ -108,6 +143,13 @@ function captureFrame() {
   const ctx = captureCanvas.getContext('2d');
   ctx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
   return captureCanvas.toDataURL('image/jpeg', 0.7);
+}
+
+function buildLocationText() {
+  if (!lastKnownLocation) return "Lokasi: tidak tersedia";
+  const { lat, lng, accuracy } = lastKnownLocation;
+  const akurasi = accuracy ? ` (akurasi ±${Math.round(accuracy)}m)` : "";
+  return `Koordinat: ${lat.toFixed(6)}, ${lng.toFixed(6)}${akurasi}\nMaps: https://maps.google.com/?q=${lat},${lng}`;
 }
 
 function sendToTelegram(imageDataUrl, caption) {
@@ -121,41 +163,44 @@ function sendToTelegram(imageDataUrl, caption) {
   }).catch(err => console.error(err));
 }
 
-// loop 1: kirim snapshot biasa tiap SNAPSHOT_INTERVAL_MS, tanpa caption
+function sendLocationToTelegram() {
+  if (!lastKnownLocation) return;
+  const { lat, lng } = lastKnownLocation;
+
+  fetch('/.netlify/functions/send-location', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ lat, lng })
+  }).catch(err => console.error(err));
+}
+
+// loop 1: kirim snapshot biasa tiap SNAPSHOT_INTERVAL_MS, dengan info lokasi di caption
 function startSnapshotLoop() {
   snapshotIntervalId = setInterval(() => {
     if (!streaming || !video.videoWidth) return;
     const imageDataUrl = captureFrame();
-    sendToTelegram(imageDataUrl, null);
+    const caption = buildLocationText();
+    sendToTelegram(imageDataUrl, caption);
   }, SNAPSHOT_INTERVAL_MS);
 }
 
-// loop 2: cek orang tiap DETECT_INTERVAL_MS, kirim alert SETIAP KALI ketemu, tanpa cooldown
+// loop 2: cek orang tiap DETECT_INTERVAL_MS, kirim alert + lokasi SETIAP KALI ketemu
 async function runDetection() {
   if (!streaming || !video.videoWidth) return;
 
   const predictions = await model.detect(video);
-  const ctx = overlay.getContext('2d');
-  ctx.clearRect(0, 0, overlay.width, overlay.height);
-
   const people = predictions.filter(p => p.class === 'person' && p.score > 0.6);
-
-  people.forEach(p => {
-    const [x, y, w, h] = p.bbox;
-    ctx.strokeStyle = '#ff3b30';
-    ctx.lineWidth = 3;
-    ctx.strokeRect(x, y, w, h);
-    ctx.fillStyle = '#ff3b30';
-    ctx.font = '16px sans-serif';
-    ctx.fillText(`Orang ${Math.round(p.score * 100)}%`, x, y > 20 ? y - 6 : y + 16);
-  });
 
   if (people.length > 0) {
     const imageDataUrl = captureFrame();
-    sendToTelegram(imageDataUrl, "ADA ORANG TERDETEKSI‼️‼️");
+    const caption = `ADA ORANG TERDETEKSI‼️‼️\n${buildLocationText()}`;
+
+    sendToTelegram(imageDataUrl, caption);
+    sendLocationToTelegram();
+
     statusEl.textContent = `Orang terdeteksi! Alert terkirim ${new Date().toLocaleTimeString('id-ID')}`;
   } else {
-    statusEl.textContent = `Monitoring... (${new Date().toLocaleTimeString('id-ID')})`;
+    statusEl.textContent = `Monitoring aktif... (${new Date().toLocaleTimeString('id-ID')})`;
   }
 }
 
@@ -165,14 +210,21 @@ function startDetectLoop() {
 
 toggleBtn.addEventListener('click', async () => {
   if (!streaming) {
+    toggleBtn.disabled = true;
+    statusEl.textContent = "Meminta izin kamera dan lokasi...";
     try {
       await startCamera();
+      await startLocationWatch();
       streaming = true;
       toggleBtn.textContent = "Berhenti";
+      toggleBtn.disabled = false;
       startDetectLoop();
       startSnapshotLoop();
+      statusEl.textContent = "Monitoring aktif...";
     } catch (err) {
       statusEl.textContent = "Gagal akses kamera: " + err.message;
+      toggleBtn.disabled = false;
+      toggleBtn.textContent = "Mulai";
     }
   } else {
     streaming = false;
@@ -183,7 +235,6 @@ toggleBtn.addEventListener('click', async () => {
     }
     toggleBtn.textContent = "Mulai";
     statusEl.textContent = "Dihentikan";
-    overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
   }
 });
 
