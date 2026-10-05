@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>CCTV HP</title>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
 <style>
   body {
     margin: 0;
@@ -15,16 +17,29 @@
     align-items: center;
     padding: 20px;
   }
-  video {
+  .wrap {
+    position: relative;
     width: 100%;
     max-width: 500px;
+  }
+  video, #overlay {
+    width: 100%;
     border-radius: 12px;
+  }
+  video {
     border: 2px solid #333;
+  }
+  #overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
   }
   #status {
     margin-top: 16px;
     font-size: 14px;
     color: #888;
+    text-align: center;
   }
   button {
     margin-top: 16px;
@@ -43,79 +58,121 @@
 </head>
 <body>
 
-<video id="camera" autoplay playsinline muted></video>
-<canvas id="canvas" style="display:none;"></canvas>
-<button id="toggleBtn">Mulai Kirim</button>
-<div id="status">Belum aktif</div>
+<div class="wrap">
+  <video id="camera" autoplay playsinline muted></video>
+  <canvas id="overlay"></canvas>
+</div>
+<canvas id="capture" style="display:none;"></canvas>
+<button id="toggleBtn" disabled>Mulai</button>
+<div id="status">Memuat model deteksi...</div>
 
 <script>
 const video = document.getElementById('camera');
-const canvas = document.getElementById('canvas');
+const overlay = document.getElementById('overlay');
+const captureCanvas = document.getElementById('capture');
 const statusEl = document.getElementById('status');
 const toggleBtn = document.getElementById('toggleBtn');
 
+let model = null;
 let streaming = false;
-let intervalId = null;
-const INTERVAL_MS = 5000; // kirim tiap 5 detik, ubah sesuai kebutuhan
+let detectLoopId = null;
+let lastAlertTime = 0;
+const ALERT_COOLDOWN_MS = 30000; // jarak minimal antar alert, 30 detik
 
-async function startCamera() {
+async function loadModel() {
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: "environment" } },
-      audio: false
-    });
-    video.srcObject = stream;
-    statusEl.textContent = "Kamera aktif, menunggu kirim pertama...";
+    model = await cocoSsd.load();
+    statusEl.textContent = "Model siap. Tekan Mulai.";
+    toggleBtn.disabled = false;
   } catch (err) {
-    statusEl.textContent = "Gagal akses kamera: " + err.message;
-    console.error(err);
+    statusEl.textContent = "Gagal load model: " + err.message;
   }
 }
 
-function captureAndSend() {
-  if (!video.videoWidth) return;
+async function startCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: "environment" } },
+    audio: false
+  });
+  video.srcObject = stream;
+  await new Promise(resolve => { video.onloadedmetadata = resolve; });
+  overlay.width = video.videoWidth;
+  overlay.height = video.videoHeight;
+}
 
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
-  const ctx = canvas.getContext('2d');
-  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-  const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
-
+function sendTelegramAlert(message, imageDataUrl) {
   fetch('/.netlify/functions/send-snapshot', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ image: dataUrl })
-  })
-  .then(res => res.json())
-  .then(data => {
-    const now = new Date().toLocaleTimeString('id-ID');
-    statusEl.textContent = data.ok
-      ? `Terkirim jam ${now}`
-      : `Gagal kirim: ${data.error || 'unknown error'}`;
-  })
-  .catch(err => {
-    statusEl.textContent = "Error jaringan: " + err.message;
+    body: JSON.stringify({ image: imageDataUrl, caption: message })
+  }).catch(err => console.error(err));
+}
+
+function captureFrame() {
+  captureCanvas.width = video.videoWidth;
+  captureCanvas.height = video.videoHeight;
+  const ctx = captureCanvas.getContext('2d');
+  ctx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
+  return captureCanvas.toDataURL('image/jpeg', 0.7);
+}
+
+async function detectLoop() {
+  if (!streaming) return;
+
+  const predictions = await model.detect(video);
+  const ctx = overlay.getContext('2d');
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+  const people = predictions.filter(p => p.class === 'person' && p.score > 0.6);
+
+  people.forEach(p => {
+    const [x, y, w, h] = p.bbox;
+    ctx.strokeStyle = '#ff3b30';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(x, y, w, h);
+    ctx.fillStyle = '#ff3b30';
+    ctx.font = '16px sans-serif';
+    ctx.fillText(`Orang ${Math.round(p.score * 100)}%`, x, y > 20 ? y - 6 : y + 16);
   });
+
+  const now = Date.now();
+
+  if (people.length > 0 && (now - lastAlertTime > ALERT_COOLDOWN_MS)) {
+    lastAlertTime = now;
+    const imageDataUrl = captureFrame();
+    sendTelegramAlert("ADA ORANG TERDETEKSI‼️‼️", imageDataUrl);
+    statusEl.textContent = `Orang terdeteksi! Alert terkirim ${new Date().toLocaleTimeString('id-ID')}`;
+  } else if (people.length === 0) {
+    statusEl.textContent = `Monitoring... (${new Date().toLocaleTimeString('id-ID')})`;
+  }
+
+  detectLoopId = requestAnimationFrame(detectLoop);
 }
 
 toggleBtn.addEventListener('click', async () => {
   if (!streaming) {
-    await startCamera();
-    streaming = true;
-    toggleBtn.textContent = "Berhenti";
-    intervalId = setInterval(captureAndSend, INTERVAL_MS);
+    try {
+      await startCamera();
+      streaming = true;
+      toggleBtn.textContent = "Berhenti";
+      detectLoop();
+    } catch (err) {
+      statusEl.textContent = "Gagal akses kamera: " + err.message;
+    }
   } else {
-    clearInterval(intervalId);
+    streaming = false;
+    cancelAnimationFrame(detectLoopId);
     if (video.srcObject) {
       video.srcObject.getTracks().forEach(track => track.stop());
     }
-    streaming = false;
-    toggleBtn.textContent = "Mulai Kirim";
+    toggleBtn.textContent = "Mulai";
     statusEl.textContent = "Dihentikan";
+    overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
   }
 });
+
+loadModel();
 </script>
 
 </body>
-  </html>
+</html>
