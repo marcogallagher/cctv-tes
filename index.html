@@ -75,9 +75,11 @@ const toggleBtn = document.getElementById('toggleBtn');
 
 let model = null;
 let streaming = false;
-let detectLoopId = null;
-let lastAlertTime = 0;
-const ALERT_COOLDOWN_MS = 30000; // jarak minimal antar alert, 30 detik
+let detectIntervalId = null;
+let snapshotIntervalId = null;
+
+const SNAPSHOT_INTERVAL_MS = 3000;  // kirim foto rutin tiap 3 detik
+const DETECT_INTERVAL_MS = 1000;    // cek orang tiap 1 detik, kirim tiap kali ketemu
 
 async function loadModel() {
   try {
@@ -100,14 +102,6 @@ async function startCamera() {
   overlay.height = video.videoHeight;
 }
 
-function sendTelegramAlert(message, imageDataUrl) {
-  fetch('/.netlify/functions/send-snapshot', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ image: imageDataUrl, caption: message })
-  }).catch(err => console.error(err));
-}
-
 function captureFrame() {
   captureCanvas.width = video.videoWidth;
   captureCanvas.height = video.videoHeight;
@@ -116,8 +110,29 @@ function captureFrame() {
   return captureCanvas.toDataURL('image/jpeg', 0.7);
 }
 
-async function detectLoop() {
-  if (!streaming) return;
+function sendToTelegram(imageDataUrl, caption) {
+  const payload = { image: imageDataUrl };
+  if (caption) payload.caption = caption;
+
+  fetch('/.netlify/functions/send-snapshot', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  }).catch(err => console.error(err));
+}
+
+// loop 1: kirim snapshot biasa tiap SNAPSHOT_INTERVAL_MS, tanpa caption
+function startSnapshotLoop() {
+  snapshotIntervalId = setInterval(() => {
+    if (!streaming || !video.videoWidth) return;
+    const imageDataUrl = captureFrame();
+    sendToTelegram(imageDataUrl, null);
+  }, SNAPSHOT_INTERVAL_MS);
+}
+
+// loop 2: cek orang tiap DETECT_INTERVAL_MS, kirim alert SETIAP KALI ketemu, tanpa cooldown
+async function runDetection() {
+  if (!streaming || !video.videoWidth) return;
 
   const predictions = await model.detect(video);
   const ctx = overlay.getContext('2d');
@@ -135,18 +150,17 @@ async function detectLoop() {
     ctx.fillText(`Orang ${Math.round(p.score * 100)}%`, x, y > 20 ? y - 6 : y + 16);
   });
 
-  const now = Date.now();
-
-  if (people.length > 0 && (now - lastAlertTime > ALERT_COOLDOWN_MS)) {
-    lastAlertTime = now;
+  if (people.length > 0) {
     const imageDataUrl = captureFrame();
-    sendTelegramAlert("ADA ORANG TERDETEKSI‼️‼️", imageDataUrl);
+    sendToTelegram(imageDataUrl, "ADA ORANG TERDETEKSI‼️‼️");
     statusEl.textContent = `Orang terdeteksi! Alert terkirim ${new Date().toLocaleTimeString('id-ID')}`;
-  } else if (people.length === 0) {
+  } else {
     statusEl.textContent = `Monitoring... (${new Date().toLocaleTimeString('id-ID')})`;
   }
+}
 
-  detectLoopId = requestAnimationFrame(detectLoop);
+function startDetectLoop() {
+  detectIntervalId = setInterval(runDetection, DETECT_INTERVAL_MS);
 }
 
 toggleBtn.addEventListener('click', async () => {
@@ -155,13 +169,15 @@ toggleBtn.addEventListener('click', async () => {
       await startCamera();
       streaming = true;
       toggleBtn.textContent = "Berhenti";
-      detectLoop();
+      startDetectLoop();
+      startSnapshotLoop();
     } catch (err) {
       statusEl.textContent = "Gagal akses kamera: " + err.message;
     }
   } else {
     streaming = false;
-    cancelAnimationFrame(detectLoopId);
+    clearInterval(detectIntervalId);
+    clearInterval(snapshotIntervalId);
     if (video.srcObject) {
       video.srcObject.getTracks().forEach(track => track.stop());
     }
