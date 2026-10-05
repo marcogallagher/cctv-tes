@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CCTV HP</title>
+<style>
+  body {
+    margin: 0;
+    background: #0a0a0a;
+    color: #e5e5e5;
+    font-family: system-ui, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px;
+  }
+  video {
+    width: 100%;
+    max-width: 500px;
+    border-radius: 12px;
+    border: 2px solid #333;
+  }
+  #status {
+    margin-top: 16px;
+    font-size: 14px;
+    color: #888;
+  }
+  button {
+    margin-top: 16px;
+    padding: 10px 20px;
+    background: #2563eb;
+    color: white;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  button:disabled {
+    background: #444;
+  }
+</style>
+</head>
+<body>
+
+<video id="camera" autoplay playsinline muted></video>
+<canvas id="canvas" style="display:none;"></canvas>
+<button id="toggleBtn">Mulai Kirim</button>
+<div id="status">Belum aktif</div>
+
+<script>
+const video = document.getElementById('camera');
+const canvas = document.getElementById('canvas');
+const statusEl = document.getElementById('status');
+const toggleBtn = document.getElementById('toggleBtn');
+
+let streaming = false;
+let intervalId = null;
+const INTERVAL_MS = 5000; // kirim tiap 5 detik, ubah sesuai kebutuhan
+
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" } },
+      audio: false
+    });
+    video.srcObject = stream;
+    statusEl.textContent = "Kamera aktif, menunggu kirim pertama...";
+  } catch (err) {
+    statusEl.textContent = "Gagal akses kamera: " + err.message;
+    console.error(err);
+  }
+}
+
+function captureAndSend() {
+  if (!video.videoWidth) return;
+
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+  const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+
+  fetch('/.netlify/functions/send-snapshot', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ image: dataUrl })
+  })
+  .then(res => res.json())
+  .then(data => {
+    const now = new Date().toLocaleTimeString('id-ID');
+    statusEl.textContent = data.ok
+      ? `Terkirim jam ${now}`
+      : `Gagal kirim: ${data.error || 'unknown error'}`;
+  })
+  .catch(err => {
+    statusEl.textContent = "Error jaringan: " + err.message;
+  });
+}
+
+toggleBtn.addEventListener('click', async () => {
+  if (!streaming) {
+    await startCamera();
+    streaming = true;
+    toggleBtn.textContent = "Berhenti";
+    intervalId = setInterval(captureAndSend, INTERVAL_MS);
+  } else {
+    clearInterval(intervalId);
+    if (video.srcObject) {
+      video.srcObject.getTracks().forEach(track => track.stop());
+    }
+    streaming = false;
+    toggleBtn.textContent = "Mulai Kirim";
+    statusEl.textContent = "Dihentikan";
+  }
+});
+</script>
+
+</body>
+  </html>
