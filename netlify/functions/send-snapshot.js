@@ -14,7 +14,7 @@ exports.handler = async (event) => {
       };
     }
 
-    const { image } = JSON.parse(event.body);
+    const { image, caption } = JSON.parse(event.body);
     if (!image) {
       return { statusCode: 400, body: JSON.stringify({ ok: false, error: 'Gambar kosong' }) };
     }
@@ -25,6 +25,9 @@ exports.handler = async (event) => {
     const formData = new FormData();
     formData.append('chat_id', chatId);
     formData.append('photo', new Blob([buffer], { type: 'image/jpeg' }), 'snapshot.jpg');
+    if (caption) {
+      formData.append('caption', caption);
+    }
 
     const tgResponse = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
       method: 'POST',
